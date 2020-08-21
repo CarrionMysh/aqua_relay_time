@@ -1,13 +1,15 @@
-#define pin_enc_clk 2
-#define pin_enc_dt 4
-#define pin_enc_sw 3
+#define pin_enc_clk A0
+#define pin_enc_dt A1
+#define pin_enc_sw A2
 #define pin_display_clk 8
 #define pin_display_din 9
 #define pin_display_ce 12
 #define pin_display_rst 11
 #define pin_display_dc 10
 #define pin_display_blk 5
-#define pin_ds18b20 A1
+#define pin_ds18b20 4
+#define pin_button1 2
+#define pin_button2 3
 
 #include "RTClib.h"
 #include <LCD5110_Basic.h>
@@ -34,6 +36,7 @@ volatile byte min;
 volatile boolean relay_on[2];
 volatile boolean splash;
 volatile boolean relay_now[2];
+volatile boolean push_buttons;
 volatile float temperature;
 byte pin_relay[2] = {6, 7};
 byte alarm_hour_on[2];
@@ -44,8 +47,11 @@ byte ds_addr[8];
 byte contrast;
 byte blk_level;
 byte blk_level_raw;
-unsigned int blk_time;
-unsigned int blk_timeout;
+unsigned long blk_time;
+unsigned long blk_timeout = 3000;
+unsigned int debounce_button = 90;
+volatile unsigned long time_push_button1 = 0;
+volatile unsigned long time_push_button2 = 0;
 int ds_resolution = 9;
 
 Encoder encoder(pin_enc_clk, pin_enc_dt, pin_enc_sw);
@@ -62,6 +68,10 @@ void setup() {
   for (byte n_relay = 0; n_relay <= 1; n_relay++) {
     pinMode(pin_relay[n_relay], OUTPUT);
     digitalWrite(pin_relay[n_relay], HIGH);
+    pinMode(pin_button1, INPUT);
+    pinMode(pin_button2, INPUT);
+    digitalWrite(pin_button1, HIGH);
+    digitalWrite(pin_button2, HIGH);
     alarm_hour_on[n_relay] = EEPROM.read(alarm_hour_on_addr[n_relay]);
     alarm_min_on[n_relay] = EEPROM.read(alarm_min_on_addr[n_relay]);
     alarm_hour_off[n_relay] = EEPROM.read(alarm_hour_off_addr[n_relay]);
@@ -73,15 +83,14 @@ void setup() {
   blk_level = EEPROM.read(blk_level_addr);
   blk_level_raw = EEPROM.read(blk_level_raw_addr);
   contrast = 60;
-  blk_level = 5;
-  blk_level_raw = blk_level * 10;
-  blk_timeout = 3000;
   disp.InitLCD();
   disp.setFont(SmallFont);
   disp.setContrast(contrast);
   analogWrite(pin_display_blk, blk_level_raw);
   encoder.setType(TYPE2);
-  Timer1.initialize();
+  Timer1.initialize(500000);
+  attachInterrupt(0, button1, LOW);
+  attachInterrupt(1, button2, LOW);
 
   ds.begin();
   ds.getAddress(ds_dev_addr, 0);
@@ -108,7 +117,8 @@ void setup() {
     disp.invertText(false);
     disp.clrScr();
   }
-
+  attachInterrupt(0, button1, LOW);
+  attachInterrupt(1, button2, LOW);
   Timer1.attachInterrupt(disp_time);
 }
 
@@ -117,10 +127,19 @@ void loop() {
   if (encoder.isClick()) {
     Timer1.detachInterrupt();
     menu();
+    blk_time = millis();
+
   }
   if (encoder.isHolded()) {
     Timer1.detachInterrupt();
     adjust_time();
+    blk_time = millis();
+
+  }
+  if (push_buttons) {
+    push_buttons = false;
+    blk_time = millis();
+    analogWrite(pin_display_blk, blk_level_raw);
   }
   if ((millis() - blk_time) > blk_timeout) analogWrite(pin_display_blk, 255);
 }
@@ -328,7 +347,6 @@ void menu() {
     if (encoder.isHolded()) flag_isHolded = true;
     if (flag_isHolded && ok) {
       disp.clrScr();
-      blk_time = millis();
       for (byte n_relay = 0; n_relay <= 1; n_relay++) {
         EEPROM.update(alarm_hour_on_addr[n_relay], alarm_hour_on[n_relay]);
         EEPROM.update(alarm_min_on_addr[n_relay], alarm_min_on[n_relay]);
@@ -478,11 +496,13 @@ void disp_time() {
       switch (n_relay) {
         case 0:
           disp.print("Timer1", LEFT, 16);
-          disp.print("OFF", 42, 16);
+          disp.print("OFF ", 48, 16);
+          disp.print("              ", 0, 24);
           break;
         case 1:
           disp.print("Timer2", LEFT, 32);
-          disp.print("OFF", 42, 32);
+          disp.print("OFF ", 48, 32);
+          disp.print("              ", 0, 40);
           break;
       }
       digitalWrite(pin_relay[n_relay], HIGH);
@@ -494,8 +514,9 @@ void disp_time() {
         case 0:
           disp.print("Relay1:", LEFT, 16);
           disp.invertText(true);
-          disp.print("ON  ", 48, 16);
+          disp.print("ON", 48, 16);
           disp.invertText(false);
+          disp.print("  ", 60, 16);
           disp.print("est1:", LEFT, 24);
           //est:
           if (t_now < t_alarm_off[n_relay]) {
@@ -662,7 +683,6 @@ void adjust_time() {
     }
     if (encoder.isHolded() && ok) {
       analogWrite(pin_display_blk, blk_level_raw);
-      blk_time = millis();
       disp.clrScr();
       rtc.adjust(DateTime(year, month, day, hour, min));
       Timer1.attachInterrupt(disp_time);
@@ -809,7 +829,6 @@ void adding_menu() {
     }
     if (encoder.isHolded()) {
       disp.clrScr();
-      blk_time = millis();
       EEPROM.update(contrast_addr, contrast);
       EEPROM.update(blk_level_addr, blk_level);
       EEPROM.update(blk_level_raw_addr, blk_level_raw);
@@ -823,5 +842,21 @@ void adding_menu() {
       Timer1.attachInterrupt(disp_time);
       return;
     }
+  }
+}
+
+void button1() {
+  if ((millis() - time_push_button1) > debounce_button) {
+    if (relay_on[0] == true) relay_on[0] = false; else relay_on[0] = true;
+    time_push_button1 = millis();
+    push_buttons = true;
+  }
+}
+
+void button2() {
+  if ((millis() - time_push_button2) > debounce_button) {
+    if (relay_on[1] == true) relay_on[1] = false; else relay_on[1] = true;
+    time_push_button2 = millis();
+    push_buttons = true;
   }
 }
